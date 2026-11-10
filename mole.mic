@@ -1,0 +1,363 @@
+; mole-18.mic - Whac-a-Mole fuer Busch Microtronic 2090 mit 8x8-LED-Matrix (ESP2090 Studio) und 4x4-Tastenfeld
+; 243 Schritte (00-F2), frei: 13
+; Version 17: unabhaengige Maulwuerfe mit Lebensdauer; lief im Emulator mit dem alten Matrix-Protokoll
+;   (Toggle der Matrix mit F, Ready dauernd auf Eingang 1).
+; Version 18: Matrixprotokoll des ESP2090 Studios (Blockmodus mit Schlafen und Wecken). Der Toggle am Start und
+;   um das Bild entfaellt. Die Matrix schlaeft zwischen den Bildern; Eingang 1 und die Ausgaenge sind damit
+;   fuer das Tastenfeld frei. Ein Bild: F anlegen und halten bis REQ, ACK 1, ein Befehl, 16 Register, 0.
+;   Am Start wird ein leeres Bild gesendet, damit die Matrix vor der ersten Tastenabfrage schlaeft.
+; Start: RESET, Matrix einschalten (Weboberflaeche: LED on, Emulator2090: m, Modus ESP), RUN.
+;   Matrix vergessen? Das Programm wartet am Anfang ohne Bild: Matrix einschalten.
+;
+; Spiel: Maulwuerfe (Felder) erscheinen und verschwinden von selbst. Jeder Maulwurf hat eine Lebensdauer,
+;   die mit der Zeit (Tick) von ihrem Startwert (zunaechst F) bis 0 sinkt. Passende Taste 0-F vor Ablauf =
+;   Treffer. Laeuft die Lebensdauer ab = Miss. Eine Taste ohne Maulwurf passiert nichts (kein Miss).
+;   Bei 3 Misses Ende: Treffer dezimal anzeigen.
+; Felder:  0 = unten links ... 3 = unten rechts ... F = oben rechts
+;   (k = 4*Zeile + Spalte, Zeile von unten, 4x4 Felder zu je 2x2 LEDs)
+;
+; Schwierigkeit (Stufe S = Treffer/16 = R6, ab 256 Treffern S = 5, max 5):
+;   Start-Lebensdauer = F - 2*S              (F, D, B, 9, 7, 5)
+;   Chance auf weiteren Maulwurf je Tick = (2*S + 2) / 16  (12,5% ... 75%)
+;   Gibt es keinen aktiven Maulwurf, entsteht sofort einer.  Maximal 3.
+; Tick: alle 3 Tastenabfragen (Software-Takt, Frames verlaengern ihn etwas).
+;
+; Tastenfeld: Reihe r (0 = unten) wird mit DOT 1, 2, 4, 8 aktiviert, DIN liefert die Spalten (Bit 1 = links).
+;   Taste = 4 * Reihe + Spalte. Mehrere Tasten in einer Reihe: die hoechste Spalte zaehlt.
+;
+; Matrix im Speicher: M0-MF, dauerhaft.  Zeile y = M(2y) links, M(2y+1) rechts;
+;   Bit 1 (LSB) links, Bit 4 rechts.  Feld links = Wert 3, rechts = Wert C.
+;   Setzen/Loeschen per Addition (+3/+C bzw. +D/+4 = -3/-C), nur nach Pruefung.
+;
+; Register (11 dauerhaft, 5 Scratch):
+;   R0 = K0  Feld Maulwurf 0      R1 = L0  Lebensdauer (0 = Platz frei)
+;   R2 = K1  Feld Maulwurf 1      R3 = L1
+;   R4 = K2  Feld Maulwurf 2      R9 = L2
+;   R5 R6 R7 = Treffer hexadezimal (R7 hoechste Stelle; EXRA -> D E F = HXDZ)
+;   RA = T Tick-Zaehler           RB = Misses (0-3)
+;   Scratch: R8 (Spalten in SCAN / Index in PLACE), RC (Strobe / Hilfsregister /
+;            F, ACK und 0 im Frame), RD (k), RE (P / Zufall), RF (Q)
+; Fenster-Technik (kein MAS): untere Bank M0-M7: EXRL; obere Bank M8-MF:
+;   EXRA, EXRM, EXRA (jeweils selbst-invers).  Persistente Register
+;   ueberleben die Fenster (Doppeltausch stellt sie wieder her).
+; Hit-Taste wird nicht entprellt: Tasten ohne Maulwurf sind folgenlos; haelt
+;   man eine Taste, trifft sie auch einen dort neu erscheinenden Maulwurf.
+; Bekannt: Wird beim Wecken eine Taste der Spalte 1 (Felder 0, 4, 8, C) gehalten, sieht das Programm ein REQ, das
+;   keines ist, und sendet das Bild zu frueh. Dieses Bild kann verloren gehen, das naechste stimmt wieder.
+; Aufbau: 1 Start, 2 Hauptschleife, 3 Treffer, 4 Tick, 5 Spawn, 6 Unterpro-
+;   gramme (LEVEL, MISS, END), 7 SCAN, 8 PLACE, 9 SHOWS (Frame)
+
+; ---------- 1. Start ----------
+F02   ; 00  DISOUT        Display aus (schneller)
+BD6   ; 01  CALL SHOWS    Startbild: leere Matrix senden. Die Matrix wacht und schlaeft danach
+; von selbst wieder ein; Eingang 1 und die Ausgaenge sind dann fuer das Tastenfeld frei
+
+; ---------- 2. Hauptschleife: Taste abtasten, Tick zaehlen ----------
+B85   ; 02  LOOP: CALL SCAN  Tastenfeld: D = k, R8 = Spaltenbits (0 = keine Taste)
+908   ; 03  CMPI 0,8     Carry = 1, wenn R8 > 0: Taste gedrueckt
+D09   ; 04  BRC TRYKEY    ja -> Taste auswerten
+51A   ; 05  TICK: ADDI 1,A  Tick-Zaehler + 1
+92A   ; 06  CMPI 2,A     Carry = 1, wenn T >= 3
+D24   ; 07  BRC DOTICK    Tick faellig
+C02   ; 08  GOTO LOOP     sonst naechste Abtastung
+
+; ---------- 3. Taste auswerten: aktiver Maulwurf auf Feld k? ----------
+; Slot i zaehlt nur, wenn Lebensdauer > 0 (alter Wert in K kann stehen bleiben).
+; Kein Treffer: Taste wird ignoriert (kein Miss).
+80D   ; 09  TRYKEY: CMP 0,D  K0 = k?
+E10   ; 0A  BRZ CH0
+82D   ; 0B  C1: CMP 2,D    K1 = k?
+E13   ; 0C  BRZ CH1
+84D   ; 0D  C2: CMP 4,D    K2 = k?
+E16   ; 0E  BRZ CH2
+C05   ; 0F  GOTO TICK     kein Maulwurf auf diesem Feld: ignorieren
+901   ; 10  CH0: CMPI 0,1  Carry = 1, wenn L0 > 0
+D19   ; 11  BRC H0
+C0B   ; 12  GOTO C1       Platz 0 war frei (alter K0): weiter pruefen
+903   ; 13  CH1: CMPI 0,3  L1 > 0?
+D1B   ; 14  BRC H1
+C0D   ; 15  GOTO C2
+909   ; 16  CH2: CMPI 0,9  L2 > 0?
+D1D   ; 17  BRC H2
+C05   ; 18  GOTO TICK
+101   ; 19  H0: MOVI 0,1   L0 = 0: Platz 0 frei
+C1E   ; 1A  GOTO HITC
+103   ; 1B  H1: MOVI 0,3   L1 = 0: Platz 1 frei
+C1E   ; 1C  GOTO HITC
+109   ; 1D  H2: MOVI 0,9   L2 = 0: Platz 2 frei
+B9E   ; 1E  HITC: CALL PCLR  Maulwurf k aus der Matrix loeschen (D = k)
+515   ; 1F  ADDI 1,5     Treffer + 1: niedrigste Stelle R5 (Carry bei Ueberlauf)
+FB6   ; 20  ADC 6        + Carry in die mittlere Stelle R6
+FB7   ; 21  ADC 7        + Carry in die hoechste Stelle R7 (FFF + 1 -> 000)
+BD6   ; 22  CALL SHOWS    Matrix anzeigen
+C05   ; 23  GOTO TICK     danach wie gehabt Tick zaehlen
+
+; ---------- 4. Tick: Lebensdauern verringern, ablaufende Maulwuerfe = Miss ----------
+10A   ; 24  DOTICK: MOVI 0,A  Tick-Zaehler zuruecksetzen
+901   ; 25  TK0: CMPI 0,1  L0 = 0 (Platz frei)?
+E29   ; 26  BRZ TK1       ja -> naechster Platz
+711   ; 27  SUBI 1,1     Lebensdauer - 1
+E66   ; 28  BRZ EX0       auf 0 gesunken: Maulwurf laeuft ab
+903   ; 29  TK1: CMPI 0,3  L1 = 0?
+E2D   ; 2A  BRZ TK2
+713   ; 2B  SUBI 1,3
+E6B   ; 2C  BRZ EX1
+909   ; 2D  TK2: CMPI 0,9  L2 = 0?
+E31   ; 2E  BRZ SPN
+719   ; 2F  SUBI 1,9
+E70   ; 30  BRZ EX2
+
+; ---------- 5. Spawn: neuer Maulwurf ----------
+; Nur wenn ein Platz frei ist.  Ohne aktiven Maulwurf immer, sonst mit der
+; Wahrscheinlichkeit (2*S+2)/16.  RND: D = Wuerfel fuer die Chance, E = Feld.
+F05   ; 31  SPN: RND      D = Chance-Wuerfel, E = Feldnummer, F ungenutzt
+901   ; 32  CMPI 0,1     L0 = 0: Platz frei?
+E39   ; 33  BRZ SP1
+903   ; 34  CMPI 0,3     L1 = 0?
+E39   ; 35  BRZ SP1
+909   ; 36  CMPI 0,9     L2 = 0?
+E39   ; 37  BRZ SP1
+C02   ; 38  GOTO LOOP     alle 3 Plaetze belegt
+01C   ; 39  SP1: MOV 1,C   C = L0
+A3C   ; 3A  OR 3,C        C = L0 OR L1
+A9C   ; 3B  OR 9,C        C = L0 OR L1 OR L2
+E43   ; 3C  BRZ SP3       alle frei: sofort spawnen
+B75   ; 3D  CALL LEVEL   C = Stufe S (0-5)
+4CC   ; 3E  ADD C,C      C = 2*S
+52C   ; 3F  ADDI 2,C     C = 2*S + 2 = Schwelle
+8DC   ; 40  CMP D,C      Carry = 1, wenn Wuerfel < Schwelle
+D43   ; 41  BRC SP3       ja -> spawnen
+C02   ; 42  GOTO LOOP     nein
+0ED   ; 43  SP3: MOV E,D   D = k (neues Feld)
+; Ist das Feld schon von einem aktiven Maulwurf belegt?  (Platz zaehlt nur mit L > 0)
+80D   ; 44  CMP 0,D      K0 = k?
+E5D   ; 45  BRZ X0
+82D   ; 46  N1: CMP 2,D   K1 = k?
+E60   ; 47  BRZ X1
+84D   ; 48  N2: CMP 4,D   K2 = k?
+E63   ; 49  BRZ X2
+B9B   ; 4A  CALL PSET    Feld ist frei: Maulwurf k in die Matrix eintragen
+B75   ; 4B  CALL LEVEL   C = Stufe S
+4CC   ; 4C  ADD C,C      C = 2*S
+1FE   ; 4D  MOVI F,E     E = F
+6CE   ; 4E  SUB C,E      E = F - 2*S = Start-Lebensdauer
+901   ; 4F  CMPI 0,1     Platz 0 frei?
+E59   ; 50  BRZ A0
+903   ; 51  CMPI 0,3     Platz 1 frei?
+E56   ; 52  BRZ A1
+0D4   ; 53  MOV D,4      Platz 2: K2 = k
+0E9   ; 54  MOV E,9      L2 = Lebensdauer
+C5B   ; 55  GOTO SPD
+0D2   ; 56  A1: MOV D,2   K1 = k
+0E3   ; 57  MOV E,3      L1 = Lebensdauer
+C5B   ; 58  GOTO SPD
+0D0   ; 59  A0: MOV D,0   K0 = k
+0E1   ; 5A  MOV E,1      L0 = Lebensdauer
+BD6   ; 5B  SPD: CALL SHOWS  neue Matrix anzeigen
+C02   ; 5C  GOTO LOOP
+; Feld k stimmt mit einem Platz ueberein: belegt nur, wenn dessen Lebensdauer > 0
+901   ; 5D  X0: CMPI 0,1   L0 > 0?
+D02   ; 5E  BRC LOOP       ja: Feld belegt, kein neuer Maulwurf
+C46   ; 5F  GOTO N1       nein (Platz frei, alter Wert): weiter pruefen
+903   ; 60  X1: CMPI 0,3   L1 > 0?
+D02   ; 61  BRC LOOP
+C48   ; 62  GOTO N2
+909   ; 63  X2: CMPI 0,9   L2 > 0?
+D02   ; 64  BRC LOOP
+C4A   ; 65  GOTO SPOK
+
+; Maulwurf Platz i abgelaufen: loeschen, anzeigen, Miss zaehlen, weiter mit Platz i+1
+00D   ; 66  EX0: MOV 0,D   D = K0
+B9E   ; 67  CALL PCLR     Maulwurf aus der Matrix loeschen
+BD6   ; 68  CALL SHOWS    anzeigen
+B7D   ; 69  CALL MISS     Miss + 1 (bei 3: Spielende)
+C29   ; 6A  GOTO TK1
+02D   ; 6B  EX1: MOV 2,D   D = K1
+B9E   ; 6C  CALL PCLR
+BD6   ; 6D  CALL SHOWS
+B7D   ; 6E  CALL MISS
+C2D   ; 6F  GOTO TK2
+04D   ; 70  EX2: MOV 4,D   D = K2
+B9E   ; 71  CALL PCLR
+BD6   ; 72  CALL SHOWS
+B7D   ; 73  CALL MISS
+C31   ; 74  GOTO SPN
+
+; ---------- 6. Unterprogramme ----------
+; LEVEL: C = Stufe S = min(R6, 5), ab 256 Treffern (R7 > 0) S = 5.
+06C   ; 75  LEVEL: MOV 6,C  C = R6 (Treffer / 16)
+907   ; 76  CMPI 0,7     Carry = 1, wenn R7 > 0
+D7B   ; 77  BRC L5
+95C   ; 78  CMPI 5,C     Carry = 1, wenn C > 5
+D7B   ; 79  BRC L5
+F07   ; 7A  RET
+15C   ; 7B  L5: MOVI 5,C   S = 5
+F07   ; 7C  RET
+
+; MISS: Miss-Zaehler + 1; bei 3 Misses direkt zum Spielende (kein Ruecksprung)
+51B   ; 7D  MISS: ADDI 1,B  Misses + 1
+93B   ; 7E  CMPI 3,B     schon 3?
+E81   ; 7F  BRZ END       ja -> Spielende
+F07   ; 80  RET
+
+; END: Treffer dezimal anzeigen.  HXDZ erwartet die Zahl in F E D (F = hoechste
+; Stelle) und liefert D = Einer, E = Zehner, F = Hunderter.  Eingabe > 3E7 -> 000.
+F0F   ; 81  END: EXRA     R5-R7 <-> RD-RF: Treffer-Zaehler liegt jetzt in D, E, F
+F03   ; 82  HXDZ         hexadezimal -> dezimal
+F3D   ; 83  DISP 3,D     Anzeige D, E, F: Hunderter Zehner Einer
+C84   ; 84  GOTO HALTLOOP  Endlosschleife, Anzeige bleibt stehen
+
+; ---------- 7. Unterprogramm SCAN: 4x4-Tastenfeld abtasten ----------
+; Schleife ueber die 4 Zeilen, rueckwaerts-BRZ (spart ein GOTO je Zeile).
+; ANNAHMEN (Emulator): Zeile r (0 = unten) wird mit DOT 1, 2, 4, 8 aktiviert,
+;   DIN liefert die Spaltenbits 1-4 (Bit 1 = links), 1 = gedrueckt.  Ergebnis:
+;   k = 4 * r + Spalte in D, Spaltenbits der Zeile in R8 (R8 = 0: keine Taste).
+;   Matrix ist hier inaktiv: kein Ready-Signal, keine Strobe-Verwechslung.
+;   DIN setzt Zero genau dann, wenn 0 gelesen wurde -> direkt BRZ.
+11C   ; 85  SCAN: MOVI 1,C  Strobe = 1 (Zeile 0)
+10D   ; 86  MOVI 0,D      D = 4 * Zeile = 0
+C8B   ; 87  GOTO SC1      in die Schleife (Schleifenabschluss steht davor: BRZ springt rueckwaerts)
+; naechste Zeile
+54D   ; 88  SCN: ADDI 4,D   D = 4 * naechste Zeile
+4CC   ; 89  ADD C,C      Strobe verdoppeln (1 -> 2 -> 4 -> 8 -> Ueberlauf)
+D94   ; 8A  BRC NOK       Ueberlauf: alle 4 Zeilen ohne Taste (R8 = 0)
+; Zeile abfragen
+FEC   ; 8B  SC1: DOT C    Zeile aktivieren
+FD8   ; 8C  DIN 8         Spaltenbits lesen; DIN setzt Zero genau dann, wenn R8 = 0
+E88   ; 8D  BRZ SCN       keine Taste -> naechste Zeile (sonst weiter mit FND)
+
+; Spalte aus den Bits bestimmen (bei mehreren Tasten zaehlt die hoechste Spalte)
+978   ; 8E  FND: CMPI 7,8   Carry = 1, wenn >= 8: Bit 4 = Spalte 3
+D99   ; 8F  BRC F3
+938   ; 90  CMPI 3,8     Carry = 1, wenn >= 4: Bit 3 = Spalte 2
+D97   ; 91  BRC F2
+918   ; 92  CMPI 1,8     Carry = 1, wenn >= 2: Bit 2 = Spalte 1
+D95   ; 93  BRC F1
+F07   ; 94  NOK: RET      Spalte 0: k = D;  (von Zeile 3 kommend: keine Taste, R8 = 0)
+51D   ; 95  F1: ADDI 1,D  k = 4 * Zeile + 1
+F07   ; 96  RET
+52D   ; 97  F2: ADDI 2,D  k = 4 * Zeile + 2
+F07   ; 98  RET
+53D   ; 99  F3: ADDI 3,D  k = 4 * Zeile + 3
+F07   ; 9A  RET
+
+; ---------- 8. Unterprogramm PLACE: Feld setzen / loeschen ----------
+; Eingabe: D = k und ein Einsprung PSET / PCLR (CALL).  Intern: R8 = k mod 8,
+;   P (RE) / Q (RF) = Masken fuer linke / rechte Feldhaelfte, vom Einsprung
+;   fest geladen.  PLACE addiert die Masken zu den zwei Matrixregistern.
+;   PSET: P=3, Q=C (nur auf FREIES Feld!).  PCLR: P=D, Q=4 (nur auf AKTIVES Feld!).
+; Kein verschachtelter CALL (nur ein Ruecksprungregister): alles in einem Stueck.
+; Einsprungadressen: laden die Masken P (RE) und Q (RF) fest und laufen in PLACE.
+13E   ; 9B  PSET: MOVI 3,E   P = 3   Setzen: linke Haelfte +3
+1CF   ; 9C  MOVI C,F      Q = C   rechte Haelfte +C
+CA0   ; 9D  GOTO PLACE
+1DE   ; 9E  PCLR: MOVI D,E   P = D   Loeschen: linke Haelfte +D = -3
+14F   ; 9F  MOVI 4,F      Q = 4   rechte Haelfte +4 = -C   (laeuft in PLACE weiter)
+
+0D8   ; A0  PLACE: MOV D,8   R8 = k
+378   ; A1  ANDI 7,8      R8 = k mod 8 (Index innerhalb der Bank)
+97D   ; A2  CMPI 7,D     Carry = 1, wenn k >= 8
+DA6   ; A3  BRC PUP       obere Bank
+F0D   ; A4  EXRL          untere Bank M0-M7 -> R0-R7
+CA9   ; A5  GOTO DISP     weiter zur Verzweigung
+
+F0F   ; A6  PUP: EXRA     R0-R7 <-> R8-RF: Logik-Register jetzt in R0-R7
+F0E   ; A7  EXRM          R8-RF <-> M8-MF: R8-RF = M8-MF (obere Matrix)
+F0F   ; A8  EXRA          R0-R7 <-> R8-RF: R0-R7 = M8-MF, Logik wieder in R8-RF
+
+; Verzweigung nach R8 = j (Index des Maulwurfs, gleich fuer beide Baenke):
+;   j = 0: R0,R2 (P)   j = 1: R0,R2 (Q)   j = 2: R1,R3 (P)   j = 3: R1,R3 (Q)
+;   j = 4: R4,R6 (P)   j = 5: R4,R6 (Q)   j = 6: R5,R7 (P)   j = 7: R5,R7 (Q)
+; j = 0-6 per CMPI/BRZ, j = 7 laeuft durch.
+908   ; A9  DISP: CMPI 0,8   ist R8 = 0?
+EBA   ; AA  BRZ M0
+918   ; AB  CMPI 1,8   ist R8 = 1?
+EBD   ; AC  BRZ M1
+928   ; AD  CMPI 2,8   ist R8 = 2?
+EC0   ; AE  BRZ M2
+938   ; AF  CMPI 3,8   ist R8 = 3?
+EC3   ; B0  BRZ M3
+948   ; B1  CMPI 4,8   ist R8 = 4?
+EC6   ; B2  BRZ M4
+958   ; B3  CMPI 5,8   ist R8 = 5?
+EC9   ; B4  BRZ M5
+968   ; B5  CMPI 6,8   ist R8 = 6?
+ECC   ; B6  BRZ M6
+
+4F5   ; B7  M7: ADD Q,R5   (j=7: Durchlauf aus der Verzweigung)
+4F7   ; B8  ADD Q,R7
+CCE   ; B9  GOTO TAIL
+
+4E0   ; BA  M0: ADD P,R0
+4E2   ; BB  ADD P,R2
+CCE   ; BC  GOTO TAIL
+
+4F0   ; BD  M1: ADD Q,R0
+4F2   ; BE  ADD Q,R2
+CCE   ; BF  GOTO TAIL
+
+4E1   ; C0  M2: ADD P,R1
+4E3   ; C1  ADD P,R3
+CCE   ; C2  GOTO TAIL
+
+4F1   ; C3  M3: ADD Q,R1
+4F3   ; C4  ADD Q,R3
+CCE   ; C5  GOTO TAIL
+
+4E4   ; C6  M4: ADD P,R4
+4E6   ; C7  ADD P,R6
+CCE   ; C8  GOTO TAIL
+
+4F4   ; C9  M5: ADD Q,R4
+4F6   ; CA  ADD Q,R6
+CCE   ; CB  GOTO TAIL
+
+4E5   ; CC  M6: ADD P,R5
+4E7   ; CD  ADD P,R7
+
+; Rueckweg: dasselbe Fenster wieder schliessen (Bank anhand k)
+97D   ; CE  TAIL: CMPI 7,D   Carry = 1, wenn k >= 8
+DD2   ; CF  BRC TUP       obere Bank
+F0D   ; D0  EXRL          untere Bank zurueck nach M0-M7
+F07   ; D1  RET
+
+F0F   ; D2  TUP: EXRA     Rueckweg obere Bank (selbe Folge wie beim Hinweg)
+F0E   ; D3  EXRM
+F0F   ; D4  EXRA          M8-MF enthaelt die Aenderung, Logik-Register wie vorher
+F07   ; D5  RET
+
+; ---------- 9. Unterprogramm SHOWS: Bild an die Matrix senden (zeitkritisch) ----------
+; Protokoll des ESP2090 Studios (Blockmodus), die Matrix schlaeft zwischen den Bildern:
+;   Wecken: F anlegen und halten, bis der ESP mit REQ antwortet (Eingang 1 = 1).
+;   Dann direkt ACK 1, genau EIN Befehl (EXRM), die 16 Register ohne Zwischenbefehl
+;   und eine 0 auf den Ausgaengen.  Danach schlaeft der ESP von selbst wieder.
+; Fuer die Matrix liegt R0-R7 = M0-M7 (EXRL) und R8-RF = M8-MF (EXRM).  C = Scratch (F / ACK / 0).
+1FC   ; D6  SHOWS: MOVI F,C  Matrix wecken: F anlegen ...
+FEC   ; D7  DOT C         ... und halten, bis der ESP mit REQ antwortet
+F0D   ; D8  EXRL          untere Bank M0-M7 nach R0-R7 (das F liegt weiter an)
+FDC   ; D9  WAITR: DIN C    auf REQ warten (Eingang 1)
+31C   ; DA  ANDI 1,C      nur Bit 1
+ED9   ; DB  BRZ WAITR     warten, bis REQ da ist (C ist dann 1 = ACK 1)
+FEC   ; DC  DOT C         ACK 1 direkt nach dem F
+F0E   ; DD  EXRM          genau ein Befehl zwischen ACK und erstem Wert: obere Bank M8-MF nach R8-RF
+FE0   ; DE  DOT 0        Zeile 0, links (R0)
+FE1   ; DF  DOT 1        Zeile 0, rechts (R1)
+FE2   ; E0  DOT 2        Zeile 1, links (R2)
+FE3   ; E1  DOT 3        Zeile 1, rechts (R3)
+FE4   ; E2  DOT 4        Zeile 2, links (R4)
+FE5   ; E3  DOT 5        Zeile 2, rechts (R5)
+FE6   ; E4  DOT 6        Zeile 3, links (R6)
+FE7   ; E5  DOT 7        Zeile 3, rechts (R7)
+FE8   ; E6  DOT 8        Zeile 4, links (R8)
+FE9   ; E7  DOT 9        Zeile 4, rechts (R9)
+FEA   ; E8  DOT A        Zeile 5, links (RA)
+FEB   ; E9  DOT B        Zeile 5, rechts (RB)
+FEC   ; EA  DOT C        Zeile 6, links (RC)
+FED   ; EB  DOT D        Zeile 6, rechts (RD)
+FEE   ; EC  DOT E        Zeile 7, links (RE)
+FEF   ; ED  DOT F        Zeile 7, rechts (RF)
+F0E   ; EE  EXRM          zurueck: Logik-Register wieder in R8-RF
+10C   ; EF  MOVI 0,C      C := 0
+FEC   ; F0  DOT C         Ausgaenge auf 0: Uebertragung fertig, der ESP schlaeft wieder
+F0D   ; F1  EXRL          Fenster schliessen: R0-R7 wieder frei
+F07   ; F2  RET
