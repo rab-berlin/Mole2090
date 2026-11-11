@@ -22,6 +22,15 @@ Tastenfeld: Reihe r (0 = unten) liegt an Ausgang r+1, Spalte c (0 = links) an Ei
 
 RESET, Matrix einschalten (siehe unten), `HALT` `NEXT` `00` `RUN`. Am Start sendet das Programm ein leeres Bild.
 
+## Geschichte
+
+- Der Urahn ist das japanische Automatenspiel *Mogura Tataki* („Maulwurf-Klopfen“, auch *Mogura Taiji*), 1975 von **Kazuo Yamada** bei der Firma TOGO entwickelt. Bandai brachte es 1977 in Serie.
+- Den Namen *Whac-A-Mole* gab ihm **Geoffrey Fechter**, der in Nordamerika die Version baute und vertrieb. Er arbeitete dafür mit der Firma Bob's Space Racers.
+- Der Ausdruck hat sich im Englischen zum Sprichwort entwickelt: *Whac-A-Mole* nennt man jede Aufgabe, bei der kaum ein Problem gelöst ist, bevor das nächste hochkommt.
+- Das Programm hier hat keinen Hammer, sondern eine Taste je Loch, und das Spiel läuft auf der Matrix des ESP2090.
+
+Quellen: Wikipedia „Whac-A-Mole“. Die Rolle der Bob's Space Racers ist nur dort belegt.
+
 ## Technik
 
 - Die Matrix im Speicher M0-MF ist die Wahrheit. Maulwürfe werden per Addition gesetzt (+3 / +C) und gelöscht (+D / +4). Setzen und Löschen nutzen denselben Code (PLACE).
