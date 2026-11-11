@@ -3,7 +3,7 @@
 Whac-a-Mole für den Busch Microtronic 2090 mit 8x8-LED-Matrix und 4x4-Tastenfeld.
 
 - 243 Programmschritte, 13 frei
-- Datei: [mole.mic](mole.mic) (Version 18)
+- Datei: [mole.mic](mole.mic)
 
 ## Spiel
 
@@ -48,7 +48,7 @@ Quellen: Wikipedia „Whac-A-Mole“. Die Rolle der Bob's Space Racers ist nur d
 
 ## Tempo und Schwierigkeit einstellen
 
-Alle Werte stehen als `MOVI`/`CMPI`-Befehle im Programm. Die Adressen gelten für Version 18, nach Änderungen am Programm verschieben sie sich.
+Alle Werte stehen als `MOVI`/`CMPI`-Befehle im Programm. Nach Änderungen am Programm verschieben sich die Adressen.
 
 | Was | Adresse | Befehl | Wirkung |
 |---|---|---|---|
@@ -67,16 +67,9 @@ Das Programm arbeitet mit dem [ESP2090 Studio](https://github.com/rab-berlin/ESP
 2. **Bild:** Dann sendet es direkt ACK 1, genau einen Befehl, die 16 Register und zum Schluss 0.
 3. **Schlafen:** Danach schläft der ESP von selbst wieder ein. Eingang 1 und die Ausgänge sind frei für das Tastenfeld.
 
-Auf der Weboberfläche „LED on“ drücken, im [Emulator2090](https://github.com/rab-berlin/Emulator2090) die Matrix mit `m` einschalten (Modus ESP). Das Programm braucht die Firmware mit „ein Befehl je Wecken“ (esp2090-firmware ab PR #38).
+Auf der Weboberfläche „LED on“ drücken, im [Emulator2090](https://github.com/rab-berlin/Emulator2090) die Matrix mit `m` einschalten (Modus ESP).
 
 Bekannt: Wird beim Wecken eine Taste der Spalte 1 (Felder 0, 4, 8, C) gehalten, kann das Bild zu früh gesendet werden und verloren gehen. Das nächste Bild stimmt wieder.
-
-## Versionen
-
-| Version | Änderung |
-|---|---|
-| 17 | Unabhängige Maulwürfe mit Lebensdauer, altes Matrixprotokoll (Umschalten mit F) |
-| 18 | Matrixprotokoll des ESP2090 Studios: Schlafen und Wecken, kein Umschalten mehr |
 
 ## Wie es gemacht ist
 
